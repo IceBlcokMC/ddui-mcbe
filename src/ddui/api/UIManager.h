@@ -1,6 +1,8 @@
 #pragma once
 #include "ddui/Export.h"
 #include <memory>
+#include <optional>
+#include <string>
 
 class ServerPlayer;
 
@@ -16,6 +18,8 @@ public:
     // 核心接口：渲染并弹窗
     DDUI_API void show(ServerPlayer& player, const MessageBox& form);
     DDUI_API void show(ServerPlayer& player, const CustomForm& form);
+    DDUI_API void show(ServerPlayer& player, const MessageBox& form, std::string const& screenId);
+    DDUI_API void show(ServerPlayer& player, const CustomForm& form, std::string const& screenId);
 
     // 强制把 DataStore 当前状态同步给客户端
     DDUI_API void flush(ServerPlayer& player);

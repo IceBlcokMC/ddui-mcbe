@@ -6,6 +6,7 @@
 #include "mc/scripting/data_sync/PathQueryError.h"
 #include "mc/scripting/data_sync/PathUtility.h"
 #include "mc/server/ServerPlayer.h"
+#include "mc/world/actor/player/Player.h"
 
 #include <variant>
 
@@ -38,7 +39,11 @@ void ObservableBase::bind(ServerPlayer& player) { mImpl->player = &player; }
 
 void ObservableBase::forceSync(ServerPlayer& player) {
     if (player.mDataStoreSync) {
-        Bedrock::DDUI::sendDataStorePacketsToClient(*player.mDataStoreSync, player.mPacketSender, nullptr);
+        Bedrock::DDUI::sendDataStorePacketsToClient(
+            *player.mDataStoreSync,
+            player.mPacketSender,
+            &player.getUserEntityIdentifier()
+        );
     }
 }
 
