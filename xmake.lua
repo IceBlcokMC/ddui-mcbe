@@ -8,12 +8,12 @@ option("target_type")
     set_values("server", "client")
 option_end()
 
-option("with_addon")
+option("addon")
     set_default(false)
     set_showmenu(true)
 option_end()
 
-option("with_tests")
+option("test")
     set_default(false)
     set_showmenu(true)
 option_end()
@@ -41,13 +41,13 @@ target("ddui")
     add_files("src/**.cc")
     add_includedirs("src")
 
-    if is_config("with_addon") then 
+    if has_config("addon") then 
         add_files("src-addon/**.cc")
         add_includedirs("src-addon")
         add_defines("DDUI_WITH_ADDON")
     end
 
-    if is_config("with_tests") then
+    if has_config("test") then
         add_files("tests/**.cc")
         add_includedirs("tests")
         add_defines("DDUI_WITH_TESTS")
