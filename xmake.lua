@@ -1,6 +1,7 @@
 add_rules("mode.debug", "mode.release")
 
 add_repositories("levimc-repo https://github.com/LiteLDev/xmake-repo.git")
+add_repositories("miracleforest-repo https://github.com/MiracleForest/xmake-repo.git")
 
 option("target_type")
     set_default("server")
@@ -18,9 +19,17 @@ option("test")
     set_showmenu(true)
 option_end()
 
-add_requires("levilamina", {configs = {target_type = get_config("target_type")}})
+option("capture_packet")
+    set_default(false)
+    set_showmenu(true)
+option_end()
 
+add_requires("levilamina", {configs = {target_type = get_config("target_type")}})
 add_requires("levibuildscript")
+
+if has_config("capture_packet") then
+    add_requires("ilistenattentively 0.12.0")
+end
 
 if not has_config("vs_runtime") then
     set_runtimes("MD")
@@ -47,10 +56,14 @@ target("ddui")
         add_defines("DDUI_WITH_ADDON")
     end
 
-    if has_config("test") then
+    if has_config("test") or has_config("capture_packet") then
         add_files("tests/**.cc")
         add_includedirs("tests")
         add_defines("DDUI_WITH_TESTS")
+        if has_config("capture_packet") then
+            add_packages("ilistenattentively")
+            add_defines("DDUI_WITH_CAPTURE_PACKET")
+        end
     end
 
     if is_config("target_type", "server") then

@@ -24,6 +24,10 @@ bool Entry::enable() {
     DDUI_TEST::init();
     getSelf().getLogger().warn("DDUI TEST ENABLED");
 #endif
+#ifdef DDUI_WITH_CAPTURE_PACKET
+    DDUI_TEST::capture_packet();
+    getSelf().getLogger().warn("DDUI CAPTRUE PACKET ENABLED");
+#endif
     return true;
 }
 bool Entry::disable() { return true; }

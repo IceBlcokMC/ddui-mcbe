@@ -15,8 +15,13 @@
 #include "mc/scripting/data_sync/DDUI.h"
 #include "mc/scripting/data_sync/DataStoreSyncServer.h"
 #include "mc/scripting/data_sync/PathQueryError.h"
-#include "mc/scripting/data_sync/PathUtility.h"
 #include "mc/server/ServerPlayer.h"
+
+// #include "mc/scripting/data_sync/PathUtility.h"
+#include "ddui/patches/PathUtility.h"
+
+#include "nlohmann/json.hpp"
+#include "nlohmann/json_fwd.hpp"
 
 #include <unordered_map>
 #include <vector>
@@ -34,15 +39,23 @@ namespace ddui {
 
 namespace {
 
-constexpr auto MessageBoxDataStoreName = "script_ui";
-constexpr auto MessageBoxPropertyName  = "message_box";
-constexpr auto CustomFormDataStoreName = "script_ui";
-constexpr auto CustomFormPropertyName  = "custom_form";
+constexpr auto DefaultMessageBoxScreenId = "minecraft:message_box";
+constexpr auto DefaultCustomFormScreenId = "minecraft:custom_form";
 
-// These ids must exist in the client's DataDrivenUIRepository. A server-side mod
-// cannot create the matching ddui/root document just by sending a ShowScreen packet.
-constexpr auto DefaultMessageBoxScreenId = "script_ui:message_box";
-constexpr auto DefaultCustomFormScreenId = "script_ui:custom_form";
+void applyJsonToDataStore(
+    Bedrock::DDUI::DataStoreSyncServer& sync,
+    const std::string&                  ds,
+    const std::string&                  prop,
+    const nlohmann::json&               data
+) {
+    std::string jsonStr = data.dump();
+
+    auto opt = Bedrock::DDUI::PathUtility::stringToDynamicValue(jsonStr);
+    if (!opt) {
+        throw std::runtime_error("Failed to convert JSON to dynamic value");
+    }
+    sync.set(ds, prop, *opt, true);
+}
 
 } // namespace
 
@@ -60,8 +73,8 @@ struct UIManager::Impl {
         std::optional<uint> dataInstanceId = std::nullopt
     ) {
         ClientboundDataDrivenUIShowScreenPacketPayload payload;
-        payload.mScreenId = screenId;
-        payload.mFormId   = formId;
+        payload.mScreenId       = screenId;
+        payload.mFormId         = formId;
         payload.mDataInstanceId = dataInstanceId.value_or(formId);
 
         ClientboundDataDrivenUIShowScreenPacket packet(std::move(payload));
@@ -94,36 +107,45 @@ void UIManager::show(ServerPlayer& player, const MessageBox& form, std::string c
     auto* sync = player.mDataStoreSync.get();
     if (!sync) return;
 
-    uint        formId  = ll::form::FormIdManager::genFormId();
-    std::string ds      = MessageBoxDataStoreName;
-    auto&       state   = mImpl->states[&player];
-    state.currentFormId = formId;
+    uint        formId = ll::form::FormIdManager::genFormId();
+    std::string ds     = "minecraft";
 
-    // 初始化属性
-    sync->setPropertyUpdateAllowed(ds, MessageBoxPropertyName, "response", true);
-    sync->setPath(ds, MessageBoxPropertyName, "title", form.getTitle(), true, true);
-    sync->setPath(ds, MessageBoxPropertyName, "body", form.getBody(), true, true);
+    // 1. 构建符合抓包规范的 MessageBox 对象
+    nlohmann::json data = {
+        {"title",   form.getTitle()                                                },
+        {"body",    form.getBody()                                                 },
+        {"button1",
+         {{"label", form.getButton1()},
+          {"onClick", 0}, // 对应抓包中的 onClick: 0
+          {"tooltip", ""}}                                                         },
+        {"button2", {{"label", form.getButton2()}, {"onClick", 0}, {"tooltip", ""}}}
+    };
 
-    sync->setPath(ds, MessageBoxPropertyName, "button1.text", form.getButton1(), true, true);
-    sync->setPath(ds, MessageBoxPropertyName, "button2.text", form.getButton2(), true, true);
-    sync->setPath(ds, MessageBoxPropertyName, "response", -1.0, true, true);
+    // 2. 注入数据
+    applyJsonToDataStore(*sync, ds, "message_box_data", data);
 
+    // 3. 激活表单状态（必须！）
+    cereal::DynamicValue active{};
+    active.mType          = cereal::DynamicValue::Type::Boolean;
+    active.mStorage.mBool = true;
+    sync->set(ds, "ddui_form_active", active, true);
+
+    // 4. 允许客户端回传响应
+    sync->setPropertyUpdateAllowed(ds, "message_box_data", "response", true);
+
+    // 5. 监听响应
     auto sub = sync->listen(
         ds,
-        MessageBoxPropertyName,
+        "message_box_data",
         "response",
         [&player, cb = form.getCallback()](cereal::DynamicValue const* val) {
-            if (cb && val) {
-                // TODO: Fake SDK 未暴露完整 DynamicValue 解包，暂传固定或强转
-                cb(player, 1);
-            }
+            if (cb) cb(player, 1); // TODO 逻辑处理
         }
     );
-
     mImpl->states[&player].subscriptions.push_back(std::move(sub));
 
     flush(player);
-    mImpl->sendShowPacket(player, screenId, formId, formId);
+    mImpl->sendShowPacket(player, "minecraft:message_box", formId, formId);
 }
 void UIManager::show(ServerPlayer& player, const CustomForm& form) { show(player, form, DefaultCustomFormScreenId); }
 
@@ -131,57 +153,84 @@ void UIManager::show(ServerPlayer& player, const CustomForm& form, std::string c
     auto* sync = player.mDataStoreSync.get();
     if (!sync) return;
 
-    uint        formId  = ll::form::FormIdManager::genFormId();
-    std::string ds      = CustomFormDataStoreName;
-    auto&       state   = mImpl->states[&player];
-    state.currentFormId = formId;
+    uint        formId = ll::form::FormIdManager::genFormId();
+    std::string ds     = "minecraft";
+    std::string prop   = "custom_form_data";
 
-    sync->setPropertyUpdateAllowed(ds, CustomFormPropertyName, "submit", true);
-    sync->setPath(ds, CustomFormPropertyName, "title", form.getTitle(), true, true);
+    nlohmann::json layoutObj = nlohmann::json::object();
+    auto const&    controls  = form.getControls();
 
-    auto const& controls = form.getControls();
     for (size_t i = 0; i < controls.size(); ++i) {
-        // 按照 PathUtility 的解析规则，使用数组语法 controls[i]
-        std::string bp = "controls[" + std::to_string(i) + "]";
+        nlohmann::json item;
+        std::string    type = controls[i]->type;
 
-        // 属性访问使用 '.'
-        sync->setPath(ds, CustomFormPropertyName, bp + ".type", controls[i]->type, true, true);
-        sync->setPath(ds, CustomFormPropertyName, bp + ".text", controls[i]->text, true, true);
+        // 核心：OreUI 依赖 xxx_visible 字段来决定显示哪个控件
+        item["visible"]         = true;
+        item[type + "_visible"] = true;
 
-        if (controls[i]->type == "button") {
-            std::string btnPath = bp + ".pressed";
-            sync->setPath(ds, CustomFormPropertyName, btnPath, false, true, true);
-            sync->setPropertyUpdateAllowed(ds, CustomFormPropertyName, btnPath, true);
-
-            auto sub = sync->listen(
-                ds,
-                CustomFormPropertyName,
-                btnPath,
-                [&player, btnCb = controls[i]->onClick](cereal::DynamicValue const* val) {
-                    (void)val;
-                    if (btnCb) btnCb(player); 
-                }
-            );
-            mImpl->states[&player].subscriptions.push_back(std::move(sub));
-        } else {
-            sync->setPath(ds, CustomFormPropertyName, bp + ".value", controls[i]->value, true, true);
-            sync->setPropertyUpdateAllowed(ds, CustomFormPropertyName, bp + ".value", true);
+        if (type == "label") {
+            item["text"] = controls[i]->text;
+        } else if (type == "toggle") {
+            item["label"]       = controls[i]->text;
+            item["toggled"]     = std::get<bool>(controls[i]->value);
+            item["description"] = "";
+            item["disabled"]    = false;
+        } else if (type == "slider") {
+            item["label"]    = controls[i]->text;
+            item["value"]    = std::get<double>(controls[i]->value);
+            item["minValue"] = 0.0;
+            item["maxValue"] = 100.0;
+            item["step"]     = 1.0;
+            item["disabled"] = false;
+        } else if (type == "button") {
+            item["label"]    = controls[i]->text;
+            item["onClick"]  = 0;
+            item["tooltip"]  = "";
+            item["disabled"] = false;
         }
+
+        // 使用字符串索引以符合 Mojang "Fake Array"
+        layoutObj[std::to_string(i)] = item;
+    }
+    layoutObj["length"] = controls.size();
+
+    nlohmann::json root = {
+        {"title",       form.getTitle()                                               },
+        {"closeButton", {{"button_visible", true}, {"label", "Close"}, {"onClick", 0}}},
+        {"layout",      layoutObj                                                     }
+    };
+
+    // 1. 注入完整树
+    applyJsonToDataStore(*sync, ds, prop, root);
+
+    // 2. 激活 UI 状态
+    cereal::DynamicValue active{};
+    active.mType          = cereal::DynamicValue::Type::Boolean;
+    active.mStorage.mBool = true;
+    sync->set(ds, "ddui_form_active", active, true);
+
+    // 3. 注册所有子控件的可写权限（否则滑块、开关动不了）
+    for (size_t i = 0; i < controls.size(); ++i) {
+        std::string bp = "layout." + std::to_string(i); // 注意：这里用 '.'
+        if (controls[i]->type == "toggle") {
+            sync->setPropertyUpdateAllowed(ds, prop, bp + ".toggled", true);
+        } else if (controls[i]->type == "slider") {
+            sync->setPropertyUpdateAllowed(ds, prop, bp + ".value", true);
+        }
+        // auto submitSub = sync->listen(
+        //     ds,
+        //     "Property",
+        //     "submit",
+        //     [&player, cb = form.getSubmitCallback()](cereal::DynamicValue const* val) {
+        //         (void)val;
+        //         if (cb) cb(player);
+        //     }
+        // );
+        // mImpl->states[&player].subscriptions.push_back(std::move(submitSub));
     }
 
-    auto submitSub = sync->listen(
-        ds,
-        CustomFormPropertyName,
-        "submit",
-        [&player, cb = form.getSubmitCallback()](cereal::DynamicValue const* val) {
-            (void)val;
-            if (cb) cb(player);
-        }
-    );
-    mImpl->states[&player].subscriptions.push_back(std::move(submitSub));
-
     flush(player);
-    mImpl->sendShowPacket(player, screenId, formId, formId);
+    mImpl->sendShowPacket(player, "minecraft:custom_form", formId, formId);
 }
 
 } // namespace ddui
