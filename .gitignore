@@ -551,3 +551,6 @@ fabric.properties
 /bin/
 
 .xmake/
+.codex/
+dist/
+lib/

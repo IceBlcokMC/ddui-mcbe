@@ -20,8 +20,13 @@ void DDUI_TEST::capture_packet() {
     std::cout << "DDUI TEST CAPTURE PACKET CALLED" << std::endl;
     ll::event::EventBus::getInstance().emplaceListener<ila::mc::SendPacketBeforeEvent<>>(
         [](ila::mc::SendPacketBeforeEvent<>& ev) {
-            if (ev.packet().getId() == MinecraftPacketIds::MovePlayer) return; // skip MovePlayerPacket
-            fmt::print("SendPacketBeforeEvent: {}：{}\n", ev.packet().getName(), ev.packet().toString()); //
+            auto id = ev.packet().getId();
+            if (id == MinecraftPacketIds::ClientboundDataDrivenUIShowScreen
+                || id == MinecraftPacketIds::ClientboundDataDrivenUICloseScreen
+                || id == MinecraftPacketIds::ClientboundDataDrivenUIReload
+                || id == MinecraftPacketIds::ServerboundDataDrivenScreenClosed) {
+                fmt::print("{}：{}\n", ev.packet().getName(), ev.packet().toString());
+            }
         }
     );
 }
