@@ -22,7 +22,6 @@ public:
         Object  = 6,
     };
 
-    // 必须匹配 Windows MSVC 的对齐布局 (72 bytes)
     union Storage {
         NullType                                      mNull;
         bool                                          mBool;
@@ -33,20 +32,16 @@ public:
         std::unordered_map<std::string, DynamicValue> mObject;
 
         Storage() : mNull() {}
-        ~Storage() {} // 手动管理析构
+        ~Storage() {}
     } mStorage;
 
     Type mType;
-    int  _pad; // 填充以达到 72 字节的对齐要求 (64 + 4 + 4 = 72)
+    int  _pad;
 
 public:
-    // 构造函数
     DynamicValue() : mType(Type::Null) {}
-
-    // 析构函数：必须手动处理复杂类型的销毁
     ~DynamicValue() { _cleanup(); }
 
-    // 移动构造
     DynamicValue(DynamicValue&& other) noexcept : mType(Type::Null) { *this = std::move(other); }
 
     DynamicValue& operator=(DynamicValue&& other) noexcept {
@@ -81,7 +76,6 @@ public:
         return *this;
     }
 
-    // 类型访问器 (Getter)
     bool isNull() const { return mType == Type::Null; }
     Type getType() const { return mType; }
 

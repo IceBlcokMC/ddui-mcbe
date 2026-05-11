@@ -1,32 +1,26 @@
 #pragma once
+#include "CustomForm.h"
+#include "MessageBox.h"
 #include "ddui/Export.h"
-#include <memory>
-#include <optional>
-#include <string>
 
-class ServerPlayer;
+#include <memory>
+
+class Player;
 
 namespace ddui {
-
-class MessageBox;
-class CustomForm;
 
 class UIManager {
 public:
     DDUI_API static UIManager& getInstance();
 
-    // 核心接口：渲染并弹窗
-    DDUI_API void show(ServerPlayer& player, const MessageBox& form);
-    DDUI_API void show(ServerPlayer& player, const CustomForm& form);
-    DDUI_API void show(ServerPlayer& player, const MessageBox& form, std::string const& screenId);
-    DDUI_API void show(ServerPlayer& player, const CustomForm& form, std::string const& screenId);
+    bool showMessageBox(Player& player, const MessageBox& form, bool isUpdate, MessageBox::Callback callback);
+    bool showCustomForm(Player& player, const CustomForm& form, bool isUpdate, CustomForm::SubmitCallback callback);
 
-    // 强制把 DataStore 当前状态同步给客户端
-    DDUI_API void flush(ServerPlayer& player);
+    void handleScreenClosed(Player& player);
 
 private:
-    DDUI_API UIManager();
-    DDUI_API ~UIManager();
+    UIManager();
+    ~UIManager();
     UIManager(const UIManager&)            = delete;
     UIManager& operator=(const UIManager&) = delete;
 

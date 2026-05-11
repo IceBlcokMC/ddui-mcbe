@@ -76,11 +76,24 @@ function giantCustomForm(player: Player) {
   });
 
   // Button
-  form.button("Button", () => console.log("clicked"), {
-    disabled: false,
-    visible: true,
-    tooltip: btnTooltip,
-  });
+  form.button(
+    "RandomData",
+    () => {
+      let ranHex = Math.floor(Math.random() * 16777215).toString(16);
+      titleObs.setData(ranHex);
+      headerText.setData(ranHex);
+      labelText.setData(ranHex);
+      sliderVal.setData(Math.floor(Math.random() * 100));
+      dropdownVal.setData(Math.floor(Math.random() * 2));
+      textFieldText.setData(ranHex);
+      toggleVal.setData(Math.random() > 0.5);
+    },
+    {
+      disabled: false,
+      visible: true,
+      tooltip: btnTooltip,
+    }
+  );
 
   form.show();
 }
@@ -102,7 +115,6 @@ function giantMessageBox(player: Player) {
   msg.button2(msgBtn2Label, msgBtn2Tooltip);
   msg.show();
 }
-
 
 world.afterEvents.playerPlaceBlock.subscribe((event) => {
   const p = event.player;
