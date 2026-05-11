@@ -59,12 +59,10 @@ struct UIManager::Impl {
         uint                formId,
         std::optional<uint> dataInstanceId = std::nullopt
     ) {
-        // Bedrock::DDUI::sendDataStorePacketsToClient(::Bedrock::DDUI::DataStoreSyncServer &dataSync, ::PacketSender
-        // &packetSender, const ::UserEntityIdentifierComponent *id)
         ClientboundDataDrivenUIShowScreenPacketPayload payload;
-        payload.mScreenId       = screenId;
-        payload.mFormId         = formId;
-        payload.mDataInstanceId = dataInstanceId;
+        payload.mScreenId = screenId;
+        payload.mFormId   = formId;
+        payload.mDataInstanceId = dataInstanceId.value_or(formId);
 
         ClientboundDataDrivenUIShowScreenPacket packet(std::move(payload));
         player.mPacketSender.sendToClient(&player.getUserEntityIdentifier(), packet);
@@ -97,7 +95,7 @@ void UIManager::show(ServerPlayer& player, const MessageBox& form, std::string c
     if (!sync) return;
 
     uint        formId  = ll::form::FormIdManager::genFormId();
-    std::string ds      = MessageBoxDataStoreName; // 客户端 UI JSON 中定义的数据存储名
+    std::string ds      = MessageBoxDataStoreName;
     auto&       state   = mImpl->states[&player];
     state.currentFormId = formId;
 
@@ -105,30 +103,28 @@ void UIManager::show(ServerPlayer& player, const MessageBox& form, std::string c
     sync->setPropertyUpdateAllowed(ds, MessageBoxPropertyName, "response", true);
     sync->setPath(ds, MessageBoxPropertyName, "title", form.getTitle(), true, true);
     sync->setPath(ds, MessageBoxPropertyName, "body", form.getBody(), true, true);
-    sync->setPath(ds, MessageBoxPropertyName, "button1", form.getButton1(), true, true);
-    sync->setPath(ds, MessageBoxPropertyName, "button2", form.getButton2(), true, true);
+
+    sync->setPath(ds, MessageBoxPropertyName, "button1.text", form.getButton1(), true, true);
+    sync->setPath(ds, MessageBoxPropertyName, "button2.text", form.getButton2(), true, true);
     sync->setPath(ds, MessageBoxPropertyName, "response", -1.0, true, true);
 
-    // 订阅客户端点击返回
     auto sub = sync->listen(
         ds,
         MessageBoxPropertyName,
         "response",
         [&player, cb = form.getCallback()](cereal::DynamicValue const* val) {
             if (cb && val) {
-                cb(player, 1); // TODO: DynamicValue accessors are not exported in the 26.10 Fake SDK package.
+                // TODO: Fake SDK 未暴露完整 DynamicValue 解包，暂传固定或强转
+                cb(player, 1);
             }
         }
     );
 
     mImpl->states[&player].subscriptions.push_back(std::move(sub));
 
-    // 1. 同步 DataStore 状态给客户端
     flush(player);
-    // 2. 发送配对的 ShowScreen 数据包以打开界面
-    mImpl->sendShowPacket(player, screenId, formId);
+    mImpl->sendShowPacket(player, screenId, formId, formId);
 }
-
 void UIManager::show(ServerPlayer& player, const CustomForm& form) { show(player, form, DefaultCustomFormScreenId); }
 
 void UIManager::show(ServerPlayer& player, const CustomForm& form, std::string const& screenId) {
@@ -145,36 +141,34 @@ void UIManager::show(ServerPlayer& player, const CustomForm& form, std::string c
 
     auto const& controls = form.getControls();
     for (size_t i = 0; i < controls.size(); ++i) {
-        // 关键修正 1：数组用[] 包裹
-        std::string bp = "controls[" + std::to_string(i) + "]"; 
+        // 按照 PathUtility 的解析规则，使用数组语法 controls[i]
+        std::string bp = "controls[" + std::to_string(i) + "]";
 
-        // 关键修正 2：属性访问用 . 
+        // 属性访问使用 '.'
         sync->setPath(ds, CustomFormPropertyName, bp + ".type", controls[i]->type, true, true);
         sync->setPath(ds, CustomFormPropertyName, bp + ".text", controls[i]->text, true, true);
 
         if (controls[i]->type == "button") {
-            // 按钮状态监听也是用 .
-            std::string btnPath = bp + ".pressed"; 
+            std::string btnPath = bp + ".pressed";
             sync->setPath(ds, CustomFormPropertyName, btnPath, false, true, true);
             sync->setPropertyUpdateAllowed(ds, CustomFormPropertyName, btnPath, true);
 
             auto sub = sync->listen(
                 ds,
                 CustomFormPropertyName,
-                btnPath,[&player, btnCb = controls[i]->onClick](cereal::DynamicValue const* val) {
+                btnPath,
+                [&player, btnCb = controls[i]->onClick](cereal::DynamicValue const* val) {
                     (void)val;
                     if (btnCb) btnCb(player); 
                 }
             );
             mImpl->states[&player].subscriptions.push_back(std::move(sub));
         } else {
-            // 其他控件的值也是用 .
             sync->setPath(ds, CustomFormPropertyName, bp + ".value", controls[i]->value, true, true);
             sync->setPropertyUpdateAllowed(ds, CustomFormPropertyName, bp + ".value", true);
         }
     }
 
-    // 订阅表单整体提交
     auto submitSub = sync->listen(
         ds,
         CustomFormPropertyName,
@@ -187,7 +181,7 @@ void UIManager::show(ServerPlayer& player, const CustomForm& form, std::string c
     mImpl->states[&player].subscriptions.push_back(std::move(submitSub));
 
     flush(player);
-    mImpl->sendShowPacket(player, screenId, formId); // 对应的客户端 UI id
+    mImpl->sendShowPacket(player, screenId, formId, formId);
 }
 
 } // namespace ddui
