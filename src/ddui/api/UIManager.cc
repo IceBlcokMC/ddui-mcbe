@@ -59,6 +59,8 @@ struct UIManager::Impl {
         uint                formId,
         std::optional<uint> dataInstanceId = std::nullopt
     ) {
+        // Bedrock::DDUI::sendDataStorePacketsToClient(::Bedrock::DDUI::DataStoreSyncServer &dataSync, ::PacketSender
+        // &packetSender, const ::UserEntityIdentifierComponent *id)
         ClientboundDataDrivenUIShowScreenPacketPayload payload;
         payload.mScreenId       = screenId;
         payload.mFormId         = formId;
@@ -78,6 +80,7 @@ UIManager& UIManager::getInstance() {
 }
 
 void UIManager::flush(ServerPlayer& player) {
+    std::cout << "flush: mDataStoreSync=" << player.mDataStoreSync << std::endl;
     if (player.mDataStoreSync) {
         Bedrock::DDUI::sendDataStorePacketsToClient(
             *player.mDataStoreSync,
@@ -142,29 +145,32 @@ void UIManager::show(ServerPlayer& player, const CustomForm& form, std::string c
 
     auto const& controls = form.getControls();
     for (size_t i = 0; i < controls.size(); ++i) {
-        std::string bp = "controls/" + std::to_string(i);
-        sync->setPath(ds, CustomFormPropertyName, bp + "/type", controls[i]->type, true, true);
-        sync->setPath(ds, CustomFormPropertyName, bp + "/text", controls[i]->text, true, true);
+        // 关键修正 1：数组用[] 包裹
+        std::string bp = "controls[" + std::to_string(i) + "]"; 
+
+        // 关键修正 2：属性访问用 . 
+        sync->setPath(ds, CustomFormPropertyName, bp + ".type", controls[i]->type, true, true);
+        sync->setPath(ds, CustomFormPropertyName, bp + ".text", controls[i]->text, true, true);
 
         if (controls[i]->type == "button") {
-            // 给按钮注册特殊的点击监听
-            std::string btnPath = bp + "/pressed";
+            // 按钮状态监听也是用 .
+            std::string btnPath = bp + ".pressed"; 
             sync->setPath(ds, CustomFormPropertyName, btnPath, false, true, true);
             sync->setPropertyUpdateAllowed(ds, CustomFormPropertyName, btnPath, true);
 
             auto sub = sync->listen(
                 ds,
                 CustomFormPropertyName,
-                btnPath,
-                [&player, btnCb = controls[i]->onClick](cereal::DynamicValue const* val) {
+                btnPath,[&player, btnCb = controls[i]->onClick](cereal::DynamicValue const* val) {
                     (void)val;
-                    if (btnCb) btnCb(player); // 触发按钮点击的内联事件
+                    if (btnCb) btnCb(player); 
                 }
             );
             mImpl->states[&player].subscriptions.push_back(std::move(sub));
         } else {
-            sync->setPath(ds, CustomFormPropertyName, bp + "/value", controls[i]->value, true, true);
-            sync->setPropertyUpdateAllowed(ds, CustomFormPropertyName, bp + "/value", true);
+            // 其他控件的值也是用 .
+            sync->setPath(ds, CustomFormPropertyName, bp + ".value", controls[i]->value, true, true);
+            sync->setPropertyUpdateAllowed(ds, CustomFormPropertyName, bp + ".value", true);
         }
     }
 

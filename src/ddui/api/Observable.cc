@@ -38,6 +38,7 @@ ObservableBase::~ObservableBase() = default;
 void ObservableBase::bind(ServerPlayer& player) { mImpl->player = &player; }
 
 void ObservableBase::forceSync(ServerPlayer& player) {
+    std::cout << "forceSync: mDataStoreSync=" << player.mDataStoreSync << std::endl;
     if (player.mDataStoreSync) {
         Bedrock::DDUI::sendDataStorePacketsToClient(
             *player.mDataStoreSync,

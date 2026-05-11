@@ -6,6 +6,8 @@
 #include "ddui/api/MessageBox.h"
 #include "ddui/api/Observable.h"
 #include "ddui/api/UIManager.h"
+#include "ddui/api/CustomForm.h"
+#include <cstddef>
 
 void DDUI_TEST::init() {
     std::cout << "DDUI TEST INIT CALLED" << std::endl;
@@ -18,9 +20,9 @@ void DDUI_TEST::init() {
 
             player.sendMessage("test form sending...");
 
-            ddui::MessageBox msgBox{"热更新 DDUI 测试界面"};
-            msgBox.body("初始化中...").button1("确认").button2("取消").then([](Player& player, int i) {});
-            ddui::UIManager::getInstance().show(player, msgBox);
+            ddui::CustomForm f{"热更新 DDUI 测试界面"};
+            f.label("初始化中...").button("确认", NULL).button("取消",nullptr).then([](Player& player) {});
+            ddui::UIManager::getInstance().show(player, f);
         }
     );
 }
