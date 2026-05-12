@@ -115,6 +115,15 @@ struct UIManager::Impl {
     }
 
     void flushAndShowPacket(ServerPlayer& sp, uint formId, const std::string& screenId) {
+        ClientboundDataDrivenUIShowScreenPacketPayload payload;
+        payload.mScreenId       = screenId;
+        payload.mFormId         = formId;
+        payload.mDataInstanceId = std::nullopt; // SAPI 此项为空
+
+        ClientboundDataDrivenUIShowScreenPacket packet(std::move(payload));
+        sp.mPacketSender.sendToClient(&sp.getUserEntityIdentifier(), packet);
+
+        // 先 Show Screen 再提交 DataStore，对齐 SAPI 的行为
         if (sp.mDataStoreSync) {
             Bedrock::DDUI::sendDataStorePacketsToClient(
                 *sp.mDataStoreSync,
@@ -122,14 +131,6 @@ struct UIManager::Impl {
                 &sp.getUserEntityIdentifier()
             );
         }
-
-        ClientboundDataDrivenUIShowScreenPacketPayload payload;
-        payload.mScreenId       = screenId;
-        payload.mFormId         = formId;
-        payload.mDataInstanceId = std::nullopt; // 切勿给 InstanceId 赋值，否则客户端无法响应
-
-        ClientboundDataDrivenUIShowScreenPacket packet(std::move(payload));
-        sp.mPacketSender.sendToClient(&sp.getUserEntityIdentifier(), packet);
     }
 
     void closeAndCleanupUI(Player& player, bool isServerSideCall = true) {
