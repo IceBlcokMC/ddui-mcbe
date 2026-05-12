@@ -4,32 +4,6 @@
 #include <cstddef>
 #include <iostream>
 
-#ifdef DDUI_WITH_CAPTURE_PACKET
-#include "fmt/base.h"
-#include "ila/event/minecraft/server/SendMultiplePacketEvent.h"
-#include "ila/event/minecraft/server/SendPacketEvent.h"
-#include "ll/api/event/EventBus.h"
-#include "mc/network/MinecraftPacketIds.h"
-#include "mc/network/Packet.h"
-
-void DDUI_TEST::capture_packet() {
-    std::cout << "DDUI TEST CAPTURE PACKET CALLED" << std::endl;
-    ll::event::EventBus::getInstance().emplaceListener<ila::mc::SendPacketBeforeEvent<>>(
-        [](ila::mc::SendPacketBeforeEvent<>& ev) {
-            auto id = ev.packet().getId();
-            if (id == MinecraftPacketIds::ClientboundDataDrivenUIShowScreen
-                || id == MinecraftPacketIds::ClientboundDataDrivenUICloseScreen
-                || id == MinecraftPacketIds::ClientboundDataDrivenUIReload
-                || id == MinecraftPacketIds::ClientboundDataStore
-                || id == MinecraftPacketIds::ServerboundDataDrivenScreenClosed
-                || id == MinecraftPacketIds::ServerboundDataStore) {
-                fmt::print("{}：{}\n", ev.packet().getName(), ev.packet().toString());
-            }
-        }
-    );
-}
-#endif
-
 #include "ddui/api/CustomForm.h"
 #include "ddui/api/MessageBox.h"
 #include "ddui/api/Observable.h"
