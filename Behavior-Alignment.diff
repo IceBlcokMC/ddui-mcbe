@@ -1,0 +1,671 @@
+diff --git a/src/ddui/api/UIManager.cc b/src/ddui/api/UIManager.cc
+index 1b693d6..fb8a1b5 100644
+--- a/src/ddui/api/UIManager.cc
++++ b/src/ddui/api/UIManager.cc
+@@ -14,24 +14,34 @@
+ #include "mc/network/packet/ClientboundDataDrivenUIShowScreenPacket.h"
+ #include "mc/network/packet/ClientboundDataDrivenUIShowScreenPacketPayload.h"
+ #include "mc/network/packet/ServerboundDataDrivenScreenClosedPacket.h"
++#include "mc/network/packet/ServerboundDataStorePacket.h"
+ #include "mc/scripting/data_sync/DDUI.h"
++#include "mc/scripting/data_sync/DataStoreRemoval.h"
+ #include "mc/scripting/data_sync/DataStoreSyncServer.h"
++#include "mc/scripting/data_sync/DataStoreUpdate.h"
+ #include "mc/scripting/data_sync/PathQueryError.h"
+ #include "mc/server/ServerPlayer.h"
+ #include "mc/world/actor/player/Player.h"
+ 
++
++#include "ddui/patches/DataStoreChange.h"
+ #include "ddui/patches/PathUtility.h"
++
+ #include "nlohmann/json.hpp"
++#include "nlohmann/json_fwd.hpp"
+ 
++#include <string_view>
+ #include <unordered_map>
++#include <variant>
+ #include <vector>
+ 
++
+ ClientboundDataDrivenUIShowScreenPacketPayload::ClientboundDataDrivenUIShowScreenPacketPayload() = default;
+ ClientboundDataDrivenUIShowScreenPacketPayload::ClientboundDataDrivenUIShowScreenPacketPayload(
+     ClientboundDataDrivenUIShowScreenPacketPayload const&
+-)                                                                                 = default;
+-Bedrock::PubSub::Subscription::Subscription(Bedrock::PubSub::Subscription const&) = default;
+-
++)                                                                                  = default;
++Bedrock::PubSub::Subscription::Subscription(Bedrock::PubSub::Subscription const&)  = default;
++ClientboundDataDrivenUIShowScreenPacket::ClientboundDataDrivenUIShowScreenPacket() = default;
+ namespace ddui {
+ 
+ namespace {
+@@ -79,9 +89,26 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
+     ::ServerboundDataDrivenScreenClosedPacket const& packet
+ ) {
+     origin(source, packet);
+-    if (auto player = this->_getServerPlayer(source, packet.mSenderSubId)) {
+-        UIManager::getInstance().handleScreenClosed(*player);
+-    }
++    UIManager::getInstance().handleScreenClosed(source.getHash());
++}
++
++LL_AUTO_TYPE_INSTANCE_HOOK(
++    DDUIDataStoreHook,
++    ll::memory::HookPriority::Normal,
++    ServerNetworkHandler,
++    &ServerNetworkHandler::$handle,
++    void,
++    ::NetworkIdentifier const&          source,
++    ::ServerboundDataStorePacket const& packet
++) {
++    origin(source, packet);
++    // auto        json = nlohmann::json::parse(packet.toString());
++    // auto const& upd  = json["Update"];
++    // UIManager::getInstance().handleDataStoreUpdate(source.getHash(), upd);
++    // Don't call origin() — handleDataStoreUpdate handles all routing.
++    // TODO: 此处应该有更好的方式处理回调，当前的处理方式会导致 SAPI 内部回调失效。
++    // TODO: 怀疑内存状态异常，需要进一步调试。
++    // 例如对所有函数进行 HOOK，使用调试器观测内存状态（没有符号的情况下）。
+ }
+ 
+ struct UIManager::Impl {
+@@ -92,8 +119,13 @@ struct UIManager::Impl {
+         MessageBox::Callback                                              msgBoxCallback;
+         uint                                                              currentFormId = 0;
+         std::string                                                       currentProp   = "";
++        Player*                                                           player        = nullptr;
++        // path -> Observable index for interactive element routing
++        std::unordered_map<std::string, std::shared_ptr<ObservableBase>> elementObservables;
++        // path -> button callback for CustomForm layout buttons
++        std::unordered_map<std::string, CustomForm::ButtonCallback> buttonCallbacks;
+     };
+-    std::unordered_map<Player*, PlayerUIContext> contexts;
++    std::unordered_map<uint64, PlayerUIContext> contexts; // keyed by NetworkIdentifier hash
+ 
+     template <typename T>
+     void bindObservableProperty(
+@@ -114,17 +146,17 @@ struct UIManager::Impl {
+         }
+     }
+ 
+-    void flushAndShowPacket(ServerPlayer& sp, uint formId, const std::string& screenId) {
+-        ClientboundDataDrivenUIShowScreenPacketPayload payload;
+-        payload.mScreenId       = screenId;
+-        payload.mFormId         = formId;
+-        payload.mDataInstanceId = std::nullopt; // SAPI 此项为空
++    void sendShowScreenPacket(ServerPlayer& sp, uint formId, const std::string& screenId) {
++        ClientboundDataDrivenUIShowScreenPacket packet{};
++        packet.mScreenId       = screenId;
++        packet.mFormId         = formId;
++        packet.mDataInstanceId = std::nullopt; // SAPI 此项为空
+ 
+-        ClientboundDataDrivenUIShowScreenPacket packet(std::move(payload));
+         sp.mPacketSender.sendToClient(&sp.getUserEntityIdentifier(), packet);
+-
+-        // 先 Show Screen 再提交 DataStore，对齐 SAPI 的行为
++    }
++    void flushDataStore(ServerPlayer& sp) {
+         if (sp.mDataStoreSync) {
++            assert(!sp.isClientSide());
+             Bedrock::DDUI::sendDataStorePacketsToClient(
+                 *sp.mDataStoreSync,
+                 sp.mPacketSender,
+@@ -135,7 +167,9 @@ struct UIManager::Impl {
+ 
+     void closeAndCleanupUI(Player& player, bool isServerSideCall = true) {
+         auto* sp = static_cast<ServerPlayer*>(&player);
+-        auto  it = contexts.find(&player);
++        // find by network hash, not Player* (hook uses different pointer)
++        uint64 hash = sp->getUserEntityIdentifier().mNetworkId->getHash();
++        auto   it   = contexts.find(hash);
+         if (it == contexts.end()) return;
+ 
+         uint        formId = it->second.currentFormId;
+@@ -151,6 +185,14 @@ struct UIManager::Impl {
+         }
+         it->second.observableSyncs.clear();
+ 
++        // Send CloseScreen FIRST (matching SAPI order), then DataStore cleanup
++        if (isServerSideCall) {
++            ClientboundDataDrivenUICloseScreenPacket packet{};
++            packet.mFormId            = formId;
++            packet.mSerializationMode = ::SerializationMode::CerealOnly;
++            sp->mPacketSender.sendToClient(&sp->getUserEntityIdentifier(), packet);
++        }
++
+         if (sp->mDataStoreSync) {
+             sp->mDataStoreSync->set(DDUI_GLOBAL_NAMESPACE, DDUI_ACTIVE_FLAG, getBooleanDynamicValue(false), true);
+             sp->mDataStoreSync->set(DDUI_GLOBAL_NAMESPACE, prop, getNullDynamicValue(), true);
+@@ -161,12 +203,6 @@ struct UIManager::Impl {
+             );
+         }
+ 
+-        if (isServerSideCall) {
+-            ClientboundDataDrivenUICloseScreenPacket packet{};
+-            packet.mFormId = formId;
+-            sp->mPacketSender.sendToClient(&sp->getUserEntityIdentifier(), packet);
+-        }
+-
+         contexts.erase(it);
+     }
+ };
+@@ -184,15 +220,71 @@ UIManager& UIManager::getInstance() {
+     return instance;
+ }
+ 
+-void UIManager::handleScreenClosed(Player& player) {
+-    auto it = mImpl->contexts.find(&player);
++void UIManager::handleScreenClosed(uint64 netHash) {
++    auto it = mImpl->contexts.find(netHash);
+     if (it != mImpl->contexts.end()) {
+         auto cbcstm = std::move(it->second.submitCallback);
+         auto cbmsg  = std::move(it->second.msgBoxCallback);
+-        mImpl->closeAndCleanupUI(player, false);
++        if (auto* player = it->second.player) {
++            mImpl->closeAndCleanupUI(*player, false);
++        }
++        if (cbcstm) cbcstm(*it->second.player, FormCancelReason::UserClosed);
++        else if (cbmsg) cbmsg(*it->second.player, std::nullopt, FormCancelReason::UserClosed);
++    }
++}
+ 
+-        if (cbcstm) cbcstm(player, FormCancelReason::UserClosed);
+-        else if (cbmsg) cbmsg(player, std::nullopt, FormCancelReason::UserClosed);
++void UIManager::handleDataStoreUpdate(uint64 netHash, nlohmann::json const& updateJson) {
++    auto it = mImpl->contexts.find(netHash);
++    if (it == mImpl->contexts.end()) return;
++
++    auto* player = it->second.player;
++    if (!player) return;
++
++    std::string path = updateJson.value("Path", "");
++    auto const& data = updateJson["Data"];
++
++    // MessageBox button clicks
++    if (path == "button1.onClick" || path == "button2.onClick") {
++        int btn = (path == "button1.onClick") ? 1 : 2;
++        if (!it->second.msgBoxCallback) return;
++        auto cb = std::move(it->second.msgBoxCallback);
++        // Don't send CloseScreen — it doesn't work after sendUpdate.
++        // Instead, closeAndCleanupUI sends DataStore cleanup which tells client to close.
++        mImpl->closeAndCleanupUI(*player);
++        cb(*player, btn, std::nullopt);
++        return;
++    }
++    // CustomForm close button
++    if (path == "closeButton.onClick") {
++        if (!it->second.submitCallback) return;
++        auto                                     cb = std::move(it->second.submitCallback);
++        auto*                                    sp = static_cast<ServerPlayer*>(player);
++        ClientboundDataDrivenUICloseScreenPacket closePkt;
++        closePkt.mFormId            = it->second.currentFormId;
++        closePkt.mSerializationMode = ::SerializationMode::CerealOnly;
++        sp->mPacketSender.sendToClient(&sp->getUserEntityIdentifier(), closePkt);
++        cb(*player, FormCancelReason::UserClosed);
++        return;
++    }
++    // CustomForm layout button click
++    auto btnIt = it->second.buttonCallbacks.find(path);
++    if (btnIt != it->second.buttonCallbacks.end() && btnIt->second) {
++        btnIt->second(*player);
++        return;
++    }
++    // Interactive element routing (toggle, slider, dropdown, textfield)
++    auto obsIt = it->second.elementObservables.find(path);
++    if (obsIt == it->second.elementObservables.end()) return;
++
++    if (data.is_boolean()) {
++        if (auto obs = std::dynamic_pointer_cast<ObservableBoolean>(obsIt->second))
++            obs->_updateFromClient(data.get<bool>());
++    } else if (data.is_number()) {
++        if (auto obs = std::dynamic_pointer_cast<ObservableNumber>(obsIt->second))
++            obs->_updateFromClient(data.get<double>());
++    } else if (data.is_string()) {
++        if (auto obs = std::dynamic_pointer_cast<ObservableString>(obsIt->second))
++            obs->_updateFromClient(data.get<std::string>());
+     }
+ }
+ 
+@@ -201,68 +293,154 @@ bool UIManager::showMessageBox(Player& player, const MessageBox& form, bool isUp
+     auto* sync = sp->mDataStoreSync.get();
+     if (!sync) return false;
+ 
++    (void)isUpdate;
++
+     mImpl->closeAndCleanupUI(player);
+ 
+     uint formId = ll::form::FormIdManager::genFormId();
+ 
+-    nlohmann::json data = {
+-        {"title",   form.getTitle().getValue()                                                                     },
+-        {"body",    form.getBody().getValue()                                                                      },
+-        {"button1",
+-         {{"label", form.getBtn1Label().getValue()}, {"onClick", 0}, {"tooltip", form.getBtn1Tooltip().getValue()}}},
+-        {"button2",
+-         {{"label", form.getBtn2Label().getValue()}, {"onClick", 0}, {"tooltip", form.getBtn2Tooltip().getValue()}}}
+-    };
+-
+-    applyJsonToDataStore(*sync, MSG_BOX_PROP, data);
+-    sync->set(DDUI_GLOBAL_NAMESPACE, DDUI_ACTIVE_FLAG, getBooleanDynamicValue(true), true);
++    // @SAPI: message_box 默认所有属性均可写
++    sync->setPropertyUpdateAllowed(DDUI_GLOBAL_NAMESPACE, MSG_BOX_PROP, "title", true);
++    sync->setPropertyUpdateAllowed(DDUI_GLOBAL_NAMESPACE, MSG_BOX_PROP, "body", true);
++    sync->setPropertyUpdateAllowed(DDUI_GLOBAL_NAMESPACE, MSG_BOX_PROP, "button1.label", true);
++    sync->setPropertyUpdateAllowed(DDUI_GLOBAL_NAMESPACE, MSG_BOX_PROP, "button1.onClick", true);
++    sync->setPropertyUpdateAllowed(DDUI_GLOBAL_NAMESPACE, MSG_BOX_PROP, "button1.tooltip", true);
++    sync->setPropertyUpdateAllowed(DDUI_GLOBAL_NAMESPACE, MSG_BOX_PROP, "button2.label", true);
++    sync->setPropertyUpdateAllowed(DDUI_GLOBAL_NAMESPACE, MSG_BOX_PROP, "button2.onClick", true);
++    sync->setPropertyUpdateAllowed(DDUI_GLOBAL_NAMESPACE, MSG_BOX_PROP, "button2.tooltip", true);
+ 
+-    auto& ctx          = mImpl->contexts[&player];
+-    ctx.currentFormId  = formId;
+-    ctx.currentProp    = MSG_BOX_PROP;
+-    ctx.msgBoxCallback = std::move(callback);
++    // @SAPI: 发送表单时，ddui_form_active 和 message_box_data 均为 null
++    sync->set(DDUI_GLOBAL_NAMESPACE, MSG_BOX_PROP, getNullDynamicValue(), true);
++    sync->set(DDUI_GLOBAL_NAMESPACE, DDUI_ACTIVE_FLAG, getNullDynamicValue(), true);
++    {
++        // DataStoreSync::set 仅添加了 OutgoingChanges，没有设置 Store 故这里直接操作 DataStore
++        auto& store = sync->mDataStores.get();
+ 
+-    mImpl->bindObservableProperty(ctx, sp, sync, MSG_BOX_PROP, "title", form.getTitle());
+-    mImpl->bindObservableProperty(ctx, sp, sync, MSG_BOX_PROP, "body", form.getBody());
+-    mImpl->bindObservableProperty(ctx, sp, sync, MSG_BOX_PROP, "button1.label", form.getBtn1Label());
+-    mImpl->bindObservableProperty(ctx, sp, sync, MSG_BOX_PROP, "button1.tooltip", form.getBtn1Tooltip());
+-    mImpl->bindObservableProperty(ctx, sp, sync, MSG_BOX_PROP, "button2.label", form.getBtn2Label());
+-    mImpl->bindObservableProperty(ctx, sp, sync, MSG_BOX_PROP, "button2.tooltip", form.getBtn2Tooltip());
++        store[DDUI_GLOBAL_NAMESPACE][MSG_BOX_PROP]     = getNullDynamicValue();
++        store[DDUI_GLOBAL_NAMESPACE][DDUI_ACTIVE_FLAG] = getNullDynamicValue();
++    }
+ 
+-    sync->setPropertyUpdateAllowed(DDUI_GLOBAL_NAMESPACE, MSG_BOX_PROP, "button1.onClick", true);
+-    sync->setPropertyUpdateAllowed(DDUI_GLOBAL_NAMESPACE, MSG_BOX_PROP, "button2.onClick", true);
++    // @SAPI: 首包需要配置 OutgoingChanges 为后续包的同步提供依据 (依旧是接口有坑, 手动设置)
++    auto& outgoingChange_0_variant = sync->mOutgoingChanges->at(0);
++    assert(std::holds_alternative<Bedrock::DDUI::DataStoreChange>(outgoingChange_0_variant));
++    auto& typedOutgoingChange_0 = std::get<Bedrock::DDUI::DataStoreChange>(outgoingChange_0_variant);
++    {
++        auto nullOutgoing       = nlohmann::json::object();
++        nullOutgoing["body"]    = nullptr;
++        nullOutgoing["button1"] = nullptr;
++        nullOutgoing["title"]   = nullptr;
++        nullOutgoing["button2"] = nullptr;
++
++        typedOutgoingChange_0.mNewData = Bedrock::DDUI::PathUtility::stringToDynamicValue(nullOutgoing.dump()).value();
++    }
+ 
+-    auto sub1 = sync->listen(
+-        DDUI_GLOBAL_NAMESPACE,
+-        MSG_BOX_PROP,
+-        "button1.onClick",
+-        [this, &player](cereal::DynamicValue const* val) {
+-            auto it = mImpl->contexts.find(&player);
+-            if (it != mImpl->contexts.end() && it->second.msgBoxCallback) {
+-                auto cb = std::move(it->second.msgBoxCallback);
+-                mImpl->closeAndCleanupUI(player);
+-                cb(player, 1, std::nullopt);
++    // @SAPI: 首包需要监听所有路径的 Publisher，进行双向观察者绑定
++    uint64 netHash = sp->getUserEntityIdentifier().mNetworkId->getHash();
++    auto&  ctx     = mImpl->contexts[netHash];
++    ctx.player     = &player;
++    {
++        ctx.currentFormId  = formId;
++        ctx.currentProp    = MSG_BOX_PROP;
++        ctx.msgBoxCallback = std::move(callback);
++
++        // 绑定观察者数据
++        mImpl->bindObservableProperty(ctx, sp, sync, MSG_BOX_PROP, "title", form.getTitle());
++        mImpl->bindObservableProperty(ctx, sp, sync, MSG_BOX_PROP, "body", form.getBody());
++        mImpl->bindObservableProperty(ctx, sp, sync, MSG_BOX_PROP, "button1.label", form.getBtn1Label());
++        mImpl->bindObservableProperty(ctx, sp, sync, MSG_BOX_PROP, "button1.tooltip", form.getBtn1Tooltip());
++        mImpl->bindObservableProperty(ctx, sp, sync, MSG_BOX_PROP, "button2.label", form.getBtn2Label());
++        mImpl->bindObservableProperty(ctx, sp, sync, MSG_BOX_PROP, "button2.tooltip", form.getBtn2Tooltip());
++
++        // 绑定所有的 Publisher
++        auto pubTitle = sync->listen(DDUI_GLOBAL_NAMESPACE, MSG_BOX_PROP, "title", [](cereal::DynamicValue const* val) {
++            // TODO: impl
++        });
++        auto pubBody  = sync->listen(DDUI_GLOBAL_NAMESPACE, MSG_BOX_PROP, "body", [](cereal::DynamicValue const* val) {
++            // TODO: impl
++        });
++        auto pubBtn1Label =
++            sync->listen(DDUI_GLOBAL_NAMESPACE, MSG_BOX_PROP, "button1.label", [](cereal::DynamicValue const* val) {
++                // TODO: impl
++            });
++        auto pubBtn1Tooltip =
++            sync->listen(DDUI_GLOBAL_NAMESPACE, MSG_BOX_PROP, "button1.tooltip", [](cereal::DynamicValue const* val) {
++                // TODO: impl
++            });
++        auto pubBtn2Label =
++            sync->listen(DDUI_GLOBAL_NAMESPACE, MSG_BOX_PROP, "button2.label", [](cereal::DynamicValue const* val) {
++                // TODO: impl
++            });
++        auto pubBtn2Tooltip =
++            sync->listen(DDUI_GLOBAL_NAMESPACE, MSG_BOX_PROP, "button2.tooltip", [](cereal::DynamicValue const* val) {
++                // TODO: impl
++            });
++        auto pubBtn1Click = sync->listen(
++            DDUI_GLOBAL_NAMESPACE,
++            MSG_BOX_PROP,
++            "button1.onClick",
++            [this, netHash, &player](cereal::DynamicValue const* val) {
++                auto it = mImpl->contexts.find(netHash);
++                if (it != mImpl->contexts.end() && it->second.msgBoxCallback) {
++                    auto cb = std::move(it->second.msgBoxCallback);
++                    mImpl->closeAndCleanupUI(player);
++                    cb(player, 1, std::nullopt);
++                }
+             }
+-        }
+-    );
+-    ctx.subscriptions.push_back(std::move(sub1));
+-
+-    auto sub2 = sync->listen(
+-        DDUI_GLOBAL_NAMESPACE,
+-        MSG_BOX_PROP,
+-        "button2.onClick",
+-        [this, &player](cereal::DynamicValue const* val) {
+-            auto it = mImpl->contexts.find(&player);
+-            if (it != mImpl->contexts.end() && it->second.msgBoxCallback) {
+-                auto cb = std::move(it->second.msgBoxCallback);
+-                mImpl->closeAndCleanupUI(player);
+-                cb(player, 2, std::nullopt);
++        );
++        auto pubBtn2Click = sync->listen(
++            DDUI_GLOBAL_NAMESPACE,
++            MSG_BOX_PROP,
++            "button2.onClick",
++            [this, netHash, &player](cereal::DynamicValue const* val) {
++                auto it = mImpl->contexts.find(netHash);
++                if (it != mImpl->contexts.end() && it->second.msgBoxCallback) {
++                    auto cb = std::move(it->second.msgBoxCallback);
++                    mImpl->closeAndCleanupUI(player);
++                    cb(player, 2, std::nullopt);
++                }
+             }
+-        }
+-    );
+-    ctx.subscriptions.push_back(std::move(sub2));
++        );
++
++        ctx.subscriptions.push_back(std::move(pubTitle));
++        ctx.subscriptions.push_back(std::move(pubBody));
++        ctx.subscriptions.push_back(std::move(pubBtn1Label));
++        ctx.subscriptions.push_back(std::move(pubBtn1Tooltip));
++        ctx.subscriptions.push_back(std::move(pubBtn2Label));
++        ctx.subscriptions.push_back(std::move(pubBtn2Tooltip));
++        ctx.subscriptions.push_back(std::move(pubBtn1Click));
++        ctx.subscriptions.push_back(std::move(pubBtn2Click));
++    }
++
++    // 按照 SAPI 时序，先弹出表单，再提交数据
++    mImpl->sendShowScreenPacket(*sp, formId, MSG_BOX_SCREEN_ID);
++
++    // 对空数据进行实例化(这里不能使用 set，因为 set 会追加数据导致客户端无法解析数据包)
++    {
++        // 根据数据包和成员校对，这里八成是上面的 typedOutgoingChange_0
++        auto instance                  = nlohmann::json::object();
++        instance["title"]              = form.getTitle().getValue();
++        instance["body"]               = form.getBody().getValue();
++        instance["button1"]["label"]   = form.getBtn1Label().getValue();
++        instance["button1"]["tooltip"] = form.getBtn1Tooltip().getValue();
++        instance["button2"]["label"]   = form.getBtn2Label().getValue();
++        instance["button2"]["tooltip"] = form.getBtn2Tooltip().getValue();
++        // 这里需要手动设置一个 onClick 计数
++        instance["button2"]["onClick"] = 0;
++        instance["button2"]["onClick"] = 0;
++
++        typedOutgoingChange_0.mNewData = Bedrock::DDUI::PathUtility::stringToDynamicValue(instance.dump()).value();
++
++        // ? 内存显示，第二个元素的 DataStoreChange::mNewData 是 true 而不是 null
++        auto& outgoingChange_1_variant = sync->mOutgoingChanges->at(1);
++        assert(std::holds_alternative<Bedrock::DDUI::DataStoreChange>(outgoingChange_1_variant));
++        auto& typedOutgoingChange_1 = std::get<Bedrock::DDUI::DataStoreChange>(outgoingChange_1_variant);
++
++        typedOutgoingChange_1.mNewData = getBooleanDynamicValue(true);
++    }
++
++    // 提交数据
++    mImpl->flushDataStore(*sp);
+ 
+-    mImpl->flushAndShowPacket(*sp, formId, MSG_BOX_SCREEN_ID);
+     return true;
+ }
+ 
+@@ -350,7 +528,9 @@ bool UIManager::showCustomForm(
+     applyJsonToDataStore(*sync, CSTM_FORM_PROP, root);
+     sync->set(DDUI_GLOBAL_NAMESPACE, DDUI_ACTIVE_FLAG, getBooleanDynamicValue(true), true);
+ 
+-    auto& ctx          = mImpl->contexts[&player];
++    uint64 netHash     = sp->getUserEntityIdentifier().mNetworkId->getHash();
++    auto&  ctx         = mImpl->contexts[netHash];
++    ctx.player         = &player;
+     ctx.currentFormId  = formId;
+     ctx.currentProp    = CSTM_FORM_PROP;
+     ctx.submitCallback = std::move(callback);
+@@ -437,8 +617,8 @@ bool UIManager::showCustomForm(
+         DDUI_GLOBAL_NAMESPACE,
+         CSTM_FORM_PROP,
+         "closeButton.onClick",
+-        [this, &player](cereal::DynamicValue const* val) {
+-            auto it = mImpl->contexts.find(&player);
++        [this, netHash, &player](cereal::DynamicValue const* val) {
++            auto it = mImpl->contexts.find(netHash);
+             if (it != mImpl->contexts.end() && it->second.submitCallback) {
+                 auto cb = std::move(it->second.submitCallback);
+                 mImpl->closeAndCleanupUI(player);
+@@ -448,7 +628,7 @@ bool UIManager::showCustomForm(
+     );
+     ctx.subscriptions.push_back(std::move(closeSub));
+ 
+-    mImpl->flushAndShowPacket(*sp, formId, CSTM_FORM_SCREEN_ID);
++    // mImpl->flushAndShowPacket(*sp, formId, CSTM_FORM_SCREEN_ID);
+     return true;
+ }
+ 
+diff --git a/src/ddui/api/UIManager.h b/src/ddui/api/UIManager.h
+index c47cf4d..97d6e0c 100644
+--- a/src/ddui/api/UIManager.h
++++ b/src/ddui/api/UIManager.h
+@@ -3,7 +3,11 @@
+ #include "MessageBox.h"
+ #include "ddui/Export.h"
+ 
++#include "mc/_HeaderOutputPredefine.h"
++#include "nlohmann/json.hpp"
++
+ #include <memory>
++#include <string>
+ 
+ class Player;
+ 
+@@ -16,7 +20,8 @@ class UIManager {
+     bool showMessageBox(Player& player, const MessageBox& form, bool isUpdate, MessageBox::Callback callback);
+     bool showCustomForm(Player& player, const CustomForm& form, bool isUpdate, CustomForm::SubmitCallback callback);
+ 
+-    void handleScreenClosed(Player& player);
++    void handleScreenClosed(uint64 netHash);
++    void handleDataStoreUpdate(uint64 netHash, nlohmann::json const& updateJson);
+ 
+ private:
+     UIManager();
+diff --git a/src/ddui/patches/DataStoreChange.h b/src/ddui/patches/DataStoreChange.h
+new file mode 100644
+index 0000000..0b370f1
+--- /dev/null
++++ b/src/ddui/patches/DataStoreChange.h
+@@ -0,0 +1,43 @@
++#pragma once
++
++#include "mc/_HeaderOutputPredefine.h"
++
++#include "DynamicValue.h"
++
++namespace Bedrock::DDUI {
++
++struct DataStoreChange {
++public:
++    // member variables
++    // NOLINTBEGIN
++    ::ll::TypedStorage<8, 32, ::std::string>          mDataStoreName;
++    ::ll::TypedStorage<8, 32, ::std::string>          mProperty;
++    ::ll::TypedStorage<4, 4, uint>                    mUpdateCount;
++    ::ll::TypedStorage<8, 72, ::cereal::DynamicValue> mNewData;
++    // NOLINTEND
++
++public:
++    // prevent constructor by default
++    DataStoreChange(DataStoreChange const&);
++    DataStoreChange();
++
++public:
++    // member functions
++    // NOLINTBEGIN
++    MCAPI ::Bedrock::DDUI::DataStoreChange& operator=(::Bedrock::DDUI::DataStoreChange&&);
++
++    MCAPI ::Bedrock::DDUI::DataStoreChange& operator=(::Bedrock::DDUI::DataStoreChange const&);
++
++    MCAPI bool operator==(::Bedrock::DDUI::DataStoreChange const& rhs) const;
++
++    MCAPI ~DataStoreChange();
++    // NOLINTEND
++
++public:
++    // destructor thunk
++    // NOLINTBEGIN
++    MCAPI void $dtor();
++    // NOLINTEND
++};
++
++} // namespace Bedrock::DDUI
+diff --git a/src/ddui/patches/DynamicValue.h b/src/ddui/patches/DynamicValue.h
+index 4f6d8b5..8d96361 100644
+--- a/src/ddui/patches/DynamicValue.h
++++ b/src/ddui/patches/DynamicValue.h
+@@ -129,5 +129,8 @@ class DynamicValue {
+ };
+ 
+ static_assert(sizeof(DynamicValue) == 72, "DynamicValue size mismatch with Bedrock Server!");
++static_assert(offsetof(DynamicValue, mType) == 64);
++static_assert(sizeof(DynamicValue) == 72);
++static_assert(alignof(DynamicValue) == 8);
+ 
+ } // namespace cereal
+\ No newline at end of file
+diff --git a/tests/test.cc b/tests/test.cc
+index e3de9c5..82547bd 100644
+--- a/tests/test.cc
++++ b/tests/test.cc
+@@ -16,62 +16,82 @@
+ #include "mc/world/actor/player/Player.h"
+ 
+ void DDUI_TEST::init() {
+-    std::cout << "DDUI TEST INIT CALLED" << std::endl;
++    std::cout << "DDUI 测试已加载" << std::endl;
+ 
+     auto& ov = ll::command::CommandRegistrar::getInstance(false).getOrCreateCommand("dduit");
+ 
+-    ov.overload().text("message_box").execute([](CommandOrigin const& origin, CommandOutput& output) {
++    // ============ 1. MessageBox 测试 ============
++    ov.overload().text("msgbox").execute([](CommandOrigin const& origin, CommandOutput& output) {
+         auto& player = static_cast<Player&>(*origin.getEntity());
+ 
+-        ddui::MessageBox msg{"Test DDUI MessageBox"};
+-        msg.setContent("This is the highly reactive DDUI MessageBox.")
+-            .appendButton1("Upper", "UpperTip")
+-            .appendButton2("Lower", "LowerTip")
++        ddui::MessageBox msg{"测试 MessageBox"};
++        msg.setContent("这是一个响应式 DDUI 弹窗，点击按钮测试回调。")
++            .appendButton1("上方按钮", "上方提示文字")
++            .appendButton2("下方按钮", "下方提示文字")
+             .sendTo(player, [](Player& player, std::optional<int> idx, std::optional<ddui::FormCancelReason>) {
+-                fmt::print("Player {} clicked MessageBox button {}\n", player.getRealName(), idx.value_or(-1));
++                if (idx == 1) fmt::print("玩家 {} 点击了 [上方按钮]\n", player.getRealName());
++                else if (idx == 2) fmt::print("玩家 {} 点击了 [下方按钮]\n", player.getRealName());
++                else fmt::print("玩家 {} 按 ESC 关闭了弹窗\n", player.getRealName());
+             });
+     });
+ 
+-    ov.overload().text("custom_form").execute([](CommandOrigin const& origin, CommandOutput& output) {
++    // ============ 2. CustomForm 测试 ============
++    ov.overload().text("form").execute([](CommandOrigin const& origin, CommandOutput& output) {
+         auto& player = static_cast<Player&>(*origin.getEntity());
+ 
+-        static auto obsTitle    = std::make_shared<ddui::ObservableString>("Test CustomForm");
+-        static auto obsInput    = std::make_shared<ddui::ObservableString>("Default text");
++        static auto obsTitle    = std::make_shared<ddui::ObservableString>("测试表单");
++        static auto obsInput    = std::make_shared<ddui::ObservableString>("默认文本");
+         static auto obsBool     = std::make_shared<ddui::ObservableBoolean>(true);
+         static auto obsNumber   = std::make_shared<ddui::ObservableNumber>(5.0);
+         static auto obsDropdown = std::make_shared<ddui::ObservableNumber>(1.0);
+ 
+-        ddui::CustomForm form{obsTitle};         // 使用 ObservableTitle
+-        form.appendHeader("Dynamic Form Header") // 字面量
+-            .appendLabel("Please enter your configuration below:")
++        ddui::CustomForm form{obsTitle};
++        form.appendHeader("动态表单标题")
++            .appendLabel("请在下方输入配置：")
+             .appendDivider()
+             .appendSpacer()
+-            .appendToggle("Enable feature", obsBool, "Toggle it on or off")
+-            .appendSlider("Intensity", obsNumber, 0.0, 10.0, 1.0, "Slide to change value")
++            .appendToggle("启用特性", obsBool, "控制开关")
++            .appendSlider("强度", obsNumber, 0.0, 10.0, 1.0, "拖动改变数值")
+             .appendDropdown(
+-                "Select Profile",
++                "选择方案",
+                 obsDropdown,
+                 {
+-                    {"Option 1", 0, "Description 1"},
+-                    {"Option 2", 1, "Description 2"},
+-                    {"Option 3", 2, "Description 3"}
++                    {"方案一", 0, "第一个方案"},
++                    {"方案二", 1, "第二个方案"},
++                    {"方案三", 2, "第三个方案"}
+         },
+-                "Select a predefined profile"
++                "从列表中选择"
+             )
+-            .appendTextField("Input text", obsInput, "Type something here")
++            .appendTextField("输入文本", obsInput, "在这里输入内容")
+             .appendButton(
+-                "Random Update Server-Side",
++                "随机更新",
+                 [&](Player& /* player */) {
+-                    obsTitle->set(fmt::format("Random Updated! {}", std::rand() % 100));
+-                    obsInput->set(fmt::format("Random Value: {}", std::rand()));
++                    obsTitle->set(fmt::format("随机值: {}", std::rand() % 100));
++                    obsInput->set(fmt::format("随机: {}", std::rand()));
+                     obsBool->set(!obsBool->get());
+                     obsNumber->set(std::rand() % 10);
+                     obsDropdown->set(std::rand() % 3);
+                 },
+-                "Click me to trigger an observable flush from the server"
++                "点击触发服务端随机更新所有值"
+             )
+-            .sendTo(player, [](Player&, std::optional<ddui::FormCancelReason>) {
+-                fmt::print("Custom form closed/submitted.\n");
++            .sendTo(player, [](Player&, std::optional<ddui::FormCancelReason>) { fmt::print("自定义表单已关闭\n"); });
++    });
++
++    // ============ 3. 自杀功能测试 ============
++    ov.overload().text("suicide").execute([](CommandOrigin const& origin, CommandOutput& output) {
++        auto& player = static_cast<Player&>(*origin.getEntity());
++
++        ddui::MessageBox msg{"确认自杀"};
++        msg.setContent("确定要自杀吗？你将在出生点复活。")
++            .appendButton1("确定自杀")
++            .appendButton2("取消")
++            .sendTo(player, [](Player& p, std::optional<int> idx, std::optional<ddui::FormCancelReason>) {
++                if (idx == 1) {
++                    p.kill();
++                    p.sendMessage("你已自杀");
++                } else {
++                    p.sendMessage("已取消");
++                }
+             });
+     });
+-}
+\ No newline at end of file
++}
